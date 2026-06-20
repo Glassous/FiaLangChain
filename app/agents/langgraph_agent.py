@@ -45,15 +45,19 @@ class LangGraphAgentRunner:
         enabled_tools: List[str],
         event_queue: asyncio.Queue
     ):
-        """Runs the agent loop and puts events into the event_queue."""
+        """Runs the agent loop and puts events into the event_queue.
+        
+        All tool calls (including web_search) go through the standard agent_step event.
+        The Go backend (agent.go) handles <search> tag injection for web_search steps.
+        No special-casing for single-search here.
+        """
         async def put_event(event: dict):
-            # Print event to stdout for docker log tracing
-            content_preview = str(event.get("content", ""))[:100]
-            print(f"[AgentTrace] Event: {event.get('type')} | Content: {content_preview}", flush=True)
+            content_preview = str(event.get("content", event.get("data", "")))[:100]
+            print(f"[AgentTrace] Event: {event.get('type')} | Preview: {content_preview}", flush=True)
             await event_queue.put(event)
 
         try:
-            # 1. Send Start Event
+            # 1. Start Event
             await put_event({"type": "start"})
 
             # Convert input messages to LangChain format
@@ -73,21 +77,15 @@ class LangGraphAgentRunner:
             # 2. Plan Generation Phase (if tools are enabled)
             plan = None
             active_tools = [TOOL_MAP[name] for name in enabled_tools if name in TOOL_MAP]
-            is_single_search = False
-            
+
             if active_tools:
                 plan = await self._generate_plan(lc_messages, active_tools)
                 if plan and plan.get("items"):
-                    items = plan["items"]
-                    # If there's only one item and it's web_search, decouple and run as single search
-                    if len(items) == 1 and items[0].get("tool_name") == "web_search":
-                        is_single_search = True
-                    
-                    if not is_single_search:
-                        await put_event({
-                            "type": "agent_plan",
-                            "data": plan["items"]
-                        })
+                    # Always send the full plan to the client
+                    await put_event({
+                        "type": "agent_plan",
+                        "data": plan["items"]
+                    })
 
             # Bind tools to LLM
             llm_with_tools = self.llm
@@ -102,28 +100,25 @@ class LangGraphAgentRunner:
             while iteration < max_iterations:
                 iteration += 1
 
-                # If we have a plan, send plan progress updates
+                # Mark current plan step as in_progress
                 if plan and plan.get("items") and plan_index < len(plan["items"]):
-                    if not is_single_search:
-                        await put_event({
-                            "type": "plan_item",
-                            "data": {"index": plan_index, "status": "in_progress"}
-                        })
+                    await put_event({
+                        "type": "plan_item",
+                        "data": {"index": plan_index, "status": "in_progress"}
+                    })
 
-                # Stream reasoning and tokens from LLM
+                # Stream LLM response (tokens + reasoning)
                 response_message = None
-                tool_calls = []
-                
+
                 async for chunk in llm_with_tools.astream(lc_messages):
+                    # Ordinary content tokens
                     if chunk.content:
-                        # Output ordinary token
                         await put_event({
                             "type": "token",
                             "content": chunk.content
                         })
-                    
-                    # Gather reasoning chunk if model provides it (e.g. DeepSeek thinking)
-                    # Some OpenAI-compatible models send reasoning content in additional fields
+
+                    # Reasoning content (e.g. DeepSeek thinking models)
                     if hasattr(chunk, "additional_kwargs") and "reasoning_content" in chunk.additional_kwargs:
                         reasoning = chunk.additional_kwargs["reasoning_content"]
                         if reasoning:
@@ -131,10 +126,7 @@ class LangGraphAgentRunner:
                                 "type": "reasoning",
                                 "content": reasoning
                             })
-                    elif hasattr(chunk, "invalid_tool_calls") or hasattr(chunk, "tool_calls"):
-                        # Accumulate tool calls
-                        pass
-                    
+
                     if response_message is None:
                         response_message = chunk
                     else:
@@ -143,15 +135,14 @@ class LangGraphAgentRunner:
                 lc_messages.append(response_message)
 
                 # Check for tool calls
+                tool_calls = []
                 if hasattr(response_message, "tool_calls") and response_message.tool_calls:
                     tool_calls = response_message.tool_calls
-                else:
-                    tool_calls = []
 
                 if not tool_calls:
-                    # Final response completed, exit loop
+                    # No tool calls -> this is the final reply
+                    # Complete any remaining plan items
                     if plan and plan.get("items") and plan_index < len(plan["items"]):
-                        # Complete remaining plan items if any
                         for i in range(plan_index, len(plan["items"])):
                             await put_event({
                                 "type": "plan_item",
@@ -159,7 +150,8 @@ class LangGraphAgentRunner:
                             })
                     break
 
-                # Execute all requested tool calls in parallel/sequence
+                # Execute tool calls — ALL tools go through agent_step (including web_search)
+                # The Go backend's agent.go converts web_search agent_step into <search> tags
                 for tc in tool_calls:
                     name = tc["name"]
                     args = tc["args"]
@@ -182,75 +174,52 @@ class LangGraphAgentRunner:
                         lc_messages.append(ToolMessage(content=err_msg, tool_call_id=call_id))
                         continue
 
-                    # Invoke the tool
                     try:
                         tool_res = await tool_obj.ainvoke(
                             args,
-                            config={"configurable": {"bocha_api_key": self.bocha_api_key, "tavily_api_key": self.tavily_api_key}}
+                            config={"configurable": {
+                                "bocha_api_key": self.bocha_api_key,
+                                "tavily_api_key": self.tavily_api_key
+                            }}
                         )
                         output_str = json.dumps(tool_res, ensure_ascii=False)
-                        if is_single_search and name == "web_search":
-                            # Decouple: send search results XML tag to client in token stream
-                            search_data = {
-                                "query": args.get("query", ""),
-                                "results": tool_res.get("results", []) if isinstance(tool_res, dict) else [],
-                                "source": tool_res.get("source", "bocha") if isinstance(tool_res, dict) else "bocha"
+                        await put_event({
+                            "type": "agent_step",
+                            "data": {
+                                "index": iteration,
+                                "tool_name": name,
+                                "tool_input": json.dumps(args, ensure_ascii=False),
+                                "tool_output": output_str,
+                                "err": "",
+                                "plan_index": plan_index if plan else None
                             }
-                            search_tag = f"\n<search>{json.dumps(search_data, ensure_ascii=False)}</search>\n"
-                            await put_event({
-                                "type": "token",
-                                "content": search_tag
-                            })
-                        else:
-                            await put_event({
-                                "type": "agent_step",
-                                "data": {
-                                    "index": iteration,
-                                    "tool_name": name,
-                                    "tool_input": json.dumps(args, ensure_ascii=False),
-                                    "tool_output": output_str,
-                                    "err": "",
-                                    "plan_index": plan_index if plan else None
-                                }
-                            })
+                        })
                         lc_messages.append(ToolMessage(content=output_str, tool_call_id=call_id))
+
                     except Exception as e:
                         err_str = str(e)
-                        if is_single_search and name == "web_search":
-                            search_data = {
-                                "query": args.get("query", ""),
-                                "results": [],
-                                "source": "bocha"
+                        await put_event({
+                            "type": "agent_step",
+                            "data": {
+                                "index": iteration,
+                                "tool_name": name,
+                                "tool_input": json.dumps(args, ensure_ascii=False),
+                                "tool_output": "",
+                                "err": err_str,
+                                "plan_index": plan_index if plan else None
                             }
-                            search_tag = f"\n<search>{json.dumps(search_data, ensure_ascii=False)}</search>\n"
-                            await put_event({
-                                "type": "token",
-                                "content": search_tag
-                            })
-                        else:
-                            await put_event({
-                                "type": "agent_step",
-                                "data": {
-                                    "index": iteration,
-                                    "tool_name": name,
-                                    "tool_input": json.dumps(args, ensure_ascii=False),
-                                    "tool_output": "",
-                                    "err": err_str,
-                                    "plan_index": plan_index if plan else None
-                                }
-                            })
+                        })
                         lc_messages.append(ToolMessage(content=err_str, tool_call_id=call_id))
 
-                # Mark plan item as completed
+                # Mark current plan item as completed and advance
                 if plan and plan.get("items") and plan_index < len(plan["items"]):
-                    if not is_single_search:
-                        await put_event({
-                            "type": "plan_item",
-                            "data": {"index": plan_index, "status": "completed"}
-                        })
+                    await put_event({
+                        "type": "plan_item",
+                        "data": {"index": plan_index, "status": "completed"}
+                    })
                     plan_index += 1
 
-            # 4. Finish Event
+            # 4. Done
             await put_event({"type": "done"})
 
         except Exception as e:
@@ -269,11 +238,11 @@ class LangGraphAgentRunner:
                 "3. 即使确实必须要执行搜索，也绝不允许安排超过一次网页搜索（web_search），严禁进行多次搜索或循环调用。\n"
                 "4. 记住：直接回答永远是首选。只有在不搜索就完全无法回答的极少数情况下，才考虑使用单次搜索。\n\n"
                 "请以 JSON 格式返回执行计划，格式如下：\n"
-                '{"items": [{"id": 1, "description": "步骤描述", "tool_name": "工具名"}]}\n\n'
-                '如果不需要任何工具或搜索，必须返回：{"items": []}\n'
+                '{\"items\": [{\"id\": 1, \"description\": \"步骤描述\", \"tool_name\": \"工具名\"}]}\n\n'
+                '如果不需要任何工具或搜索，必须返回：{\"items\": []}\n'
                 "只返回 JSON，不要包含其他解释或 MarkDown 代码块。"
             )
-            
+
             # Form plan messages context
             plan_msgs = [SystemMessage(content=prompt)]
             # Append last user message
@@ -281,14 +250,14 @@ class LangGraphAgentRunner:
                 if isinstance(msg, HumanMessage):
                     plan_msgs.append(msg)
                     break
-            
+
             res = await self.llm.ainvoke(plan_msgs)
             content = res.content.strip()
-            
+
             # Clean JSON markdown blocks if any
             if content.startswith("```"):
                 content = content.replace("```json", "").replace("```", "").strip()
-                
+
             return json.loads(content)
         except Exception:
             return None
