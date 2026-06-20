@@ -13,12 +13,32 @@ class LangGraphAgentRunner:
             base_url=base_url or settings.OPENAI_BASE_URL,
             model=model,
             temperature=temperature,
-            streaming=True
+            streaming=True,
+            request_timeout=180,  # 单次 LLM 请求最长等 3 分钟
+            max_retries=1,
         )
         self.bocha_api_key = bocha_api_key
         self.tavily_api_key = tavily_api_key
+        self.agent_timeout = 300  # 整个 agent 运行最长 5 分钟
 
     async def run(
+        self,
+        messages: List[Dict[str, str]],
+        system_prompt: str,
+        enabled_tools: List[str],
+        event_queue: asyncio.Queue
+    ):
+        """Runs the agent loop with a global timeout to prevent infinite blocking."""
+        try:
+            await asyncio.wait_for(
+                self._run_internal(messages, system_prompt, enabled_tools, event_queue),
+                timeout=self.agent_timeout
+            )
+        except asyncio.TimeoutError:
+            print(f"[AgentTrace] Agent timed out after {self.agent_timeout}s", flush=True)
+            await event_queue.put({"type": "error", "content": f"Agent 执行超时（>{self.agent_timeout}s），请稍后重试"})
+
+    async def _run_internal(
         self,
         messages: List[Dict[str, str]],
         system_prompt: str,

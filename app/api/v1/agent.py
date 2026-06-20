@@ -57,8 +57,14 @@ async def chat(
 
         try:
             while True:
-                # Wait for events from the agent runner
-                event = await event_queue.get()
+                try:
+                    # 最多等 60 秒取一个事件，防止 agent 静默挂死时连接永久阻塞
+                    event = await asyncio.wait_for(event_queue.get(), timeout=60.0)
+                except asyncio.TimeoutError:
+                    # 发送 SSE 心跳注释，保持连接并等待下一个事件
+                    yield ": ping\n\n"
+                    continue
+
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 
                 if event.get("type") in ("done", "error"):
@@ -67,7 +73,12 @@ async def chat(
             task.cancel()
             raise
         finally:
-            await task
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     return StreamingResponse(
         sse_generator(),

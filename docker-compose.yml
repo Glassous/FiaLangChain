@@ -13,3 +13,11 @@ services:
     environment:
       - PORT=8086
     restart: unless-stopped
+    networks:
+      - default
+      - alchat-shared  # 连接共享网络以供 Go 后端访问
+
+networks:
+  default: {}
+  alchat-shared:
+    external: true  # 必须提前创建: docker network create alchat-shared
